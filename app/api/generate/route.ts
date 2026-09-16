@@ -1,262 +1,565 @@
-import { NextResponse } from "next/server";
-import OpenAI from "openai";
+import { NextRequest, NextResponse } from "next/server";
 
 export const runtime = "nodejs";
+export const maxDuration = 60;
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENROUTER_API_KEY,
-  baseURL: "https://openrouter.ai/api/v1",
-  timeout: 30000,
-});
+const OPENROUTER_URL =
+  "https://openrouter.ai/api/v1/chat/completions";
 
-export async function GET() {
-  return NextResponse.json({
-    status: "ok",
-    message: "BODHA question generator is working!",
-  });
+function extractText(data: any): string {
+  const message =
+    data?.choices?.[0]?.message;
+
+  if (!message) {
+    return "";
+  }
+
+  if (
+    typeof message.content ===
+    "string"
+  ) {
+    return message.content.trim();
+  }
+
+  if (
+    Array.isArray(
+      message.content
+    )
+  ) {
+    return message.content
+      .map((item: any) => {
+        if (
+          typeof item ===
+          "string"
+        ) {
+          return item;
+        }
+
+        return (
+          item?.text ||
+          item?.content ||
+          ""
+        );
+      })
+      .join("\n")
+      .trim();
+  }
+
+  return "";
 }
 
-export async function POST(request: Request) {
+function extractJson(
+  text: string
+): any {
+  let cleaned =
+    text.trim();
+
+  cleaned = cleaned
+    .replace(
+      /^```json\s*/i,
+      ""
+    )
+    .replace(
+      /^```\s*/i,
+      ""
+    )
+    .replace(
+      /\s*```$/i,
+      ""
+    )
+    .trim();
+
+  const first =
+    cleaned.indexOf("{");
+
+  const last =
+    cleaned.lastIndexOf("}");
+
+  if (
+    first === -1 ||
+    last === -1 ||
+    last <= first
+  ) {
+    throw new Error(
+      "AI did not return valid JSON."
+    );
+  }
+
+  return JSON.parse(
+    cleaned.slice(
+      first,
+      last + 1
+    )
+  );
+}
+
+function cleanQuestions(
+  value: any
+) {
+  if (
+    !Array.isArray(value)
+  ) {
+    return [];
+  }
+
+  return value
+    .map(
+      (
+        item: any,
+        index: number
+      ) => ({
+        id:
+          typeof item?.id ===
+          "string"
+            ? item.id
+            : `${Date.now()}-${index}`,
+
+        question:
+          typeof item?.question ===
+          "string"
+            ? item.question.trim()
+            : "",
+
+        topic:
+          typeof item?.topic ===
+          "string"
+            ? item.topic.trim()
+            : "General",
+
+        difficulty:
+          item?.difficulty ===
+          "Hard"
+            ? "Hard"
+            : item?.difficulty ===
+                "Medium"
+              ? "Medium"
+              : "Easy",
+
+        correctAnswer:
+          typeof item?.correctAnswer ===
+          "string"
+            ? item.correctAnswer.trim()
+            : "",
+
+        hint:
+          typeof item?.hint ===
+          "string"
+            ? item.hint.trim()
+            : "",
+      })
+    )
+    .filter(
+      (item) =>
+        item.question.length >
+        0
+    );
+}
+
+export async function POST(
+  request: NextRequest
+) {
   try {
-    const body = await request.json();
+    const apiKey =
+      process.env.OPENROUTER_API_KEY;
 
-    const {
-      name,
-      classLevel,
-      goal,
-      progress,
-      previousQuestion,
-      previousAnswer,
-      previousCorrectAnswer,
-      previousTopic,
-      previousDifficulty,
-    } = body;
-
-    if (!classLevel) {
+    if (!apiKey) {
       return NextResponse.json(
         {
-          error: "Class level is required.",
+          error:
+            "OPENROUTER_API_KEY is missing.",
         },
-        { status: 400 }
+        { status: 500 }
       );
     }
 
-    const childName = name || "friend";
-    const childGoal = goal || "School Practice";
+    const body =
+      await request.json();
 
-    const progressData = progress || {
-      solved: 0,
-      correct: 0,
-      mistakes: 0,
-      topics: {},
-    };
+    const name =
+      typeof body?.name ===
+      "string"
+        ? body.name.trim()
+        : "Learner";
 
-    const prompt = `
-You are BODHA 🌱, an intelligent learning-question generator for children.
+    const classLevel =
+      typeof body?.classLevel ===
+      "string"
+        ? body.classLevel.trim()
+        : "2";
 
-You are NOT a random question generator.
+    const goal =
+      typeof body?.goal ===
+      "string"
+        ? body.goal.trim()
+        : "School Practice";
 
-Your job is to create the NEXT appropriate question for a child based on:
-- their class
-- their learning goal
-- their previous performance
-- topics they are strong at
-- topics they need to practise
-- their previous answer
+    const type =
+      typeof body?.type ===
+      "string"
+        ? body.type
+        : "challenge";
 
-CHILD PROFILE
-
-Name: ${childName}
-Class: ${classLevel}
-Goal: ${childGoal}
-
-LEARNING HISTORY
-
-${JSON.stringify(progressData, null, 2)}
-
-PREVIOUS QUESTION
-
-${previousQuestion || "This is the first question of the session."}
-
-PREVIOUS CHILD ANSWER
-
-${previousAnswer || "No previous answer."}
-
-PREVIOUS CORRECT ANSWER
-
-${previousCorrectAnswer || "Not available."}
-
-PREVIOUS TOPIC
-
-${previousTopic || "None."}
-
-PREVIOUS DIFFICULTY
-
-${previousDifficulty || "None."}
-
-
-IMPORTANT RULES
-
-1. Generate ONE question only.
-
-2. The question must be appropriate for Class ${classLevel}.
-
-3. The question must match the child's goal:
-   - Homework → school-style practice
-   - Olympiad → reasoning, patterns, logic and problem solving
-   - School Practice → curriculum-style practice
-   - Just Explore → interesting educational questions
-
-4. Do NOT repeat the previous question.
-
-5. Do NOT create a question that is nearly identical to the previous question.
-
-6. If the child made a mistake:
-   - Give another question that helps practise the same concept.
-   - Start slightly easier if needed.
-   - Do not make it frustrating.
-
-7. If the child answered correctly:
-   - You may increase difficulty slightly.
-   - You may introduce a related concept.
-
-8. Use the child's history to target weak topics.
-
-9. Avoid repeatedly asking the same topic when the child is already very strong unless increasing difficulty.
-
-10. The question must have ONE clear answer.
-
-11. The correct answer must be accurate.
-
-12. Never use the child's name as the character in the question.
-    The child is ${childName}.
-    Names such as Riya, Rahul, Arjun, etc. inside a word problem are fictional characters.
-
-13. Keep questions suitable for children.
-
-14. For younger children, prefer concrete situations, objects, numbers and simple language.
-
-15. For Olympiad questions, focus on THINKING rather than difficult calculations.
-
-16. Do not reveal the answer inside the question.
-
-17. Do not provide a solution.
-
-18. Return ONLY valid JSON.
-
-RETURN EXACTLY THIS STRUCTURE:
-
-{
-  "question": "The question text",
-  "topic": "Topic name",
-  "difficulty": "Easy",
-  "correctAnswer": "Answer",
-  "hint": "A very small hint that can help the mentor if needed",
-  "reasoningSkill": "The skill being practised"
-}
-
-Difficulty must be exactly:
-Easy
-Medium
-Hard
-`;
-
-    const completion =
-      await openai.chat.completions.create({
-        model: "openrouter/free",
-
-        temperature: 0.8,
-
-        response_format: {
-          type: "json_object",
-        },
-
-        messages: [
-          {
-            role: "system",
-            content: prompt,
-          },
-          {
-            role: "user",
-            content:
-              `Generate the next question for ${childName}.`,
-          },
-        ],
-      });
-
-    const raw =
-      completion.choices[0]?.message?.content || "";
-
-    if (!raw) {
-      throw new Error(
-        "BODHA question generator returned an empty response."
+    const count =
+      Math.min(
+        Math.max(
+          Number(body?.count) ||
+            5,
+          3
+        ),
+        8
       );
-    }
 
-    let cleaned = raw
-      .replace(/```json/gi, "")
-      .replace(/```/g, "")
-      .trim();
+    const exclude =
+      Array.isArray(
+        body?.exclude
+      )
+        ? body.exclude
+            .filter(
+              (item: any) =>
+                typeof item ===
+                "string"
+            )
+            .slice(-60)
+        : [];
 
-    const start = cleaned.indexOf("{");
-    const end = cleaned.lastIndexOf("}");
+    const exclusionText =
+      exclude.length > 0
+        ? exclude
+            .map(
+              (
+                question: string,
+                index: number
+              ) =>
+                `${index + 1}. ${question}`
+            )
+            .join("\n")
+        : "There are no previously used questions.";
 
-    if (start === -1 || end === -1) {
-      throw new Error(
-        "BODHA question generator returned invalid JSON."
-      );
-    }
-
-    cleaned = cleaned.substring(start, end + 1);
-
-    const parsed = JSON.parse(cleaned);
+    let activityInstruction =
+      "";
 
     if (
-      !parsed.question ||
-      !parsed.topic ||
-      !parsed.correctAnswer
+      type ===
+      "olympiad"
     ) {
-      throw new Error(
-        "BODHA generated an incomplete question."
+      activityInstruction = `
+Create reasoning-focused Olympiad-style questions.
+Use puzzles, patterns, logic, number reasoning, shapes,
+comparisons, sequences, and age-appropriate problem solving.
+Do not make them unnecessarily difficult.
+`;
+    } else if (
+      type ===
+      "homework"
+    ) {
+      activityInstruction = `
+Create school-style practice questions.
+Cover appropriate curriculum concepts for the child's class.
+Use different question styles and real-life examples.
+`;
+    } else {
+      activityInstruction = `
+Create one small, fun daily challenge style set.
+Use interesting real-life situations, puzzles, patterns,
+math, science, language, and reasoning.
+The questions should feel playful rather than repetitive.
+`;
+    }
+
+    const systemPrompt = `
+You are BODHA, an intelligent learning mentor for children.
+
+Student name: ${name}
+Class: ${classLevel}
+Goal: ${goal}
+
+Generate ${count} completely NEW questions.
+
+${activityInstruction}
+
+VERY IMPORTANT:
+- Every question must be different from the others.
+- Do not repeat any previously used question.
+- Do not merely change the numbers of an old question.
+- Change the scenario, wording, concept or reasoning approach.
+- Match the child's class level.
+- Keep questions child-friendly.
+- Make the set varied.
+- Do not use questions about politics, violence, adult topics,
+  dangerous activities, or inappropriate content.
+- Do not give explanations outside the JSON.
+- Return ONLY valid JSON.
+
+Each question must have:
+- question
+- topic
+- difficulty
+- correctAnswer
+- hint
+
+Use this exact structure:
+
+{
+  "questions": [
+    {
+      "id": "unique-id",
+      "question": "Question text",
+      "topic": "Topic",
+      "difficulty": "Easy",
+      "correctAnswer": "Answer",
+      "hint": "Small helpful hint"
+    }
+  ]
+}
+
+PREVIOUSLY USED QUESTIONS:
+${exclusionText}
+
+None of those questions may appear again.
+`;
+
+    const response =
+      await fetch(
+        OPENROUTER_URL,
+        {
+          method: "POST",
+          headers: {
+            Authorization:
+              `Bearer ${apiKey}`,
+            "Content-Type":
+              "application/json",
+            "X-Title":
+              "BODHA.ai",
+            "HTTP-Referer":
+              "https://bodha.ai",
+          },
+          body: JSON.stringify({
+            model:
+              "openrouter/free",
+
+            provider: {
+              allow_fallbacks:
+                true,
+            },
+
+            messages: [
+              {
+                role:
+                  "system",
+                content:
+                  systemPrompt,
+              },
+              {
+                role:
+                  "user",
+                content:
+                  `Create ${count} fresh questions for Class ${classLevel}.`,
+              },
+            ],
+
+            temperature:
+              0.9,
+
+            max_tokens:
+              2500,
+          }),
+        }
+      );
+
+    const raw =
+      await response.text();
+
+    if (!response.ok) {
+      console.error(
+        "Generate API error:",
+        raw
+      );
+
+      if (
+        response.status ===
+        429
+      ) {
+        return NextResponse.json(
+          {
+            error:
+              "BODHA's AI service is busy right now. Please wait a moment and try again.",
+          },
+          { status: 429 }
+        );
+      }
+
+      return NextResponse.json(
+        {
+          error:
+            "BODHA could not create fresh questions right now.",
+        },
+        { status: 502 }
       );
     }
 
-    const difficulty =
-      ["Easy", "Medium", "Hard"].includes(
-        parsed.difficulty
-      )
-        ? parsed.difficulty
-        : "Easy";
+    let data: any;
+
+    try {
+      data =
+        JSON.parse(raw);
+    } catch {
+      return NextResponse.json(
+        {
+          error:
+            "BODHA received an invalid AI response.",
+        },
+        { status: 502 }
+      );
+    }
+
+    const aiText =
+      extractText(data);
+
+    if (!aiText) {
+      return NextResponse.json(
+        {
+          error:
+            "BODHA received an empty AI response.",
+        },
+        { status: 502 }
+      );
+    }
+
+    let parsed: any;
+
+    try {
+      parsed =
+        extractJson(aiText);
+    } catch (error) {
+      console.error(
+        "Question JSON error:",
+        error
+      );
+
+      console.error(
+        "AI output:",
+        aiText
+      );
+
+      return NextResponse.json(
+        {
+          error:
+            "BODHA could not format the new questions correctly. Please try again.",
+        },
+        { status: 502 }
+      );
+    }
+
+    const questions =
+      cleanQuestions(
+        parsed?.questions
+      );
+
+    if (
+      questions.length ===
+      0
+    ) {
+      return NextResponse.json(
+        {
+          error:
+            "BODHA could not create any new questions.",
+        },
+        { status: 422 }
+      );
+    }
+
+    /*
+     * SERVER-SIDE duplicate protection.
+     */
+    const excludedNormalized =
+      new Set(
+        exclude.map(
+          (item: string) =>
+            item
+              .toLowerCase()
+              .replace(
+                /[^a-z0-9]+/g,
+                " "
+              )
+              .trim()
+        )
+      );
+
+    const seen =
+      new Set<string>();
+
+    const unique =
+      questions.filter(
+        (question: any) => {
+          const key =
+            question.question
+              .toLowerCase()
+              .replace(
+                /[^a-z0-9]+/g,
+                " "
+              )
+              .trim();
+
+          if (
+            excludedNormalized.has(
+              key
+            )
+          ) {
+            return false;
+          }
+
+          if (
+            seen.has(key)
+          ) {
+            return false;
+          }
+
+          seen.add(key);
+
+          return true;
+        }
+      );
+
+    if (
+      unique.length ===
+      0
+    ) {
+      return NextResponse.json(
+        {
+          error:
+            "BODHA generated only repeated questions. Please try again for a fresh set.",
+        },
+        { status: 422 }
+      );
+    }
 
     return NextResponse.json({
-      question: {
-        number: 1,
-        question: parsed.question,
-        topic: parsed.topic,
-        difficulty,
-        correctAnswer: String(
-          parsed.correctAnswer
+      questions:
+        unique.slice(
+          0,
+          count
         ),
-        hint: parsed.hint || "",
-        reasoningSkill:
-          parsed.reasoningSkill || "",
-      },
     });
-  } catch (error: any) {
+  } catch (error) {
     console.error(
-      "❌ BODHA GENERATOR ERROR:",
+      "Generate route error:",
       error
     );
 
     return NextResponse.json(
       {
         error:
-          error?.message ||
-          "BODHA could not create a new question.",
+          "Something went wrong while creating fresh questions.",
       },
-      {
-        status: 500,
-      }
+      { status: 500 }
     );
   }
+}
+
+export async function GET() {
+  return NextResponse.json({
+    status: "ok",
+    service:
+      "BODHA dynamic question generator",
+  });
 }
